@@ -1,7 +1,6 @@
 //! Helper actors
 
-#[cfg(feature="signal")]
-pub mod signal;
+pub mod mocker;
 
-#[cfg(feature="dns")]
-pub mod dns;
+#[cfg(feature = "resolver")]
+pub mod resolver;

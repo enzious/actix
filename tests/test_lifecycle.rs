@@ -1,20 +1,14 @@
-#![cfg_attr(feature="cargo-clippy", allow(let_unit_value))]
+#![cfg_attr(feature = "cargo-clippy", allow(let_unit_value))]
 
-extern crate actix;
-extern crate futures;
-extern crate tokio_core;
-
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-use futures::{future, Future};
-use futures::unsync::oneshot::{channel, Sender};
-use tokio_core::reactor::Timeout;
+use std::sync::{Arc, Mutex};
+
 use actix::prelude::*;
-use actix::msgs::SystemExit;
+use futures::channel::oneshot::{channel, Sender};
+use futures::FutureExt;
+use tokio::time::{delay_for, Duration};
 
-
-struct MyActor{
+struct MyActor {
     started: Arc<AtomicBool>,
     stopping: Arc<AtomicBool>,
     stopped: Arc<AtomicBool>,
@@ -23,80 +17,86 @@ struct MyActor{
 }
 
 impl Actor for MyActor {
-    type Context = Context<Self>;
+    type Context = actix::Context<Self>;
 
-    fn started(&mut self, _: &mut Context<MyActor>) {
+    fn started(&mut self, _: &mut Self::Context) {
         self.started.store(true, Ordering::Relaxed);
     }
-    fn stopping(&mut self, ctx: &mut Context<MyActor>) {
+
+    fn stopping(&mut self, ctx: &mut Self::Context) -> Running {
         self.stopping.store(true, Ordering::Relaxed);
 
         if self.restore_after_stop {
             let (tx, rx) = channel();
             self.temp = Some(tx);
-            rx.actfuture().then(|_, _: &mut MyActor, _: &mut _| {
-                fut::result(Ok(()))
-            }).spawn(ctx);
+            ctx.spawn(rx.map(|_| ()).into_actor(self));
+            Running::Continue
+        } else {
+            Running::Stop
         }
     }
-    fn stopped(&mut self, _: &mut Context<MyActor>) {
+
+    fn stopped(&mut self, _: &mut Self::Context) {
+        self.stopped.store(true, Ordering::Relaxed);
+    }
+}
+
+struct MySyncActor {
+    started: Arc<AtomicBool>,
+    stopping: Arc<AtomicBool>,
+    stopped: Arc<AtomicBool>,
+    restore_after_stop: bool,
+}
+
+impl Actor for MySyncActor {
+    type Context = actix::SyncContext<Self>;
+
+    fn started(&mut self, _: &mut Self::Context) {
+        self.started.store(true, Ordering::Relaxed);
+    }
+    fn stopping(&mut self, _: &mut Self::Context) -> Running {
+        self.stopping.store(true, Ordering::Relaxed);
+
+        if self.restore_after_stop {
+            self.restore_after_stop = false;
+            Running::Continue
+        } else {
+            Running::Stop
+        }
+    }
+    fn stopped(&mut self, _: &mut Self::Context) {
         self.stopped.store(true, Ordering::Relaxed);
     }
 }
 
 #[test]
 fn test_active_address() {
-    let sys = System::new("test");
-
     let started = Arc::new(AtomicBool::new(false));
     let stopping = Arc::new(AtomicBool::new(false));
     let stopped = Arc::new(AtomicBool::new(false));
+    let started1 = Arc::clone(&started);
+    let stopping1 = Arc::clone(&stopping);
+    let stopped1 = Arc::clone(&stopped);
 
-    let _addr: Address<_> = MyActor{
-        started: Arc::clone(&started),
-        stopping: Arc::clone(&stopping),
-        stopped: Arc::clone(&stopped),
-        temp: None, restore_after_stop: false,
-    }.start();
+    let addr = Arc::new(Mutex::new(None));
+    let addr2 = Arc::clone(&addr);
 
-    Arbiter::handle().spawn(
-        Timeout::new(Duration::new(0, 100), Arbiter::handle()).unwrap()
-            .then(|_| {
-                Arbiter::system().send(SystemExit(0));
-                future::result(Ok(()))
-            })
-    );
+    let _ = std::thread::spawn(move || {
+        let _ = System::run(move || {
+            *addr2.lock().unwrap() = Some(
+                MyActor {
+                    started: started1,
+                    stopping: stopping1,
+                    stopped: stopped1,
+                    temp: None,
+                    restore_after_stop: false,
+                }
+                .start(),
+            );
+        });
+    });
+    std::thread::sleep(Duration::from_millis(100));
 
-    sys.run();
-    assert!(started.load(Ordering::Relaxed), "Not started");
-    assert!(!stopping.load(Ordering::Relaxed), "Stopping");
-    assert!(!stopped.load(Ordering::Relaxed), "Stopped");
-}
-
-#[test]
-fn test_active_sync_address() {
-    let sys = System::new("test");
-
-    let started = Arc::new(AtomicBool::new(false));
-    let stopping = Arc::new(AtomicBool::new(false));
-    let stopped = Arc::new(AtomicBool::new(false));
-
-    let _addr: SyncAddress<_> = MyActor{
-        started: Arc::clone(&started),
-        stopping: Arc::clone(&stopping),
-        stopped: Arc::clone(&stopped),
-        temp: None, restore_after_stop: false,
-    }.start();
-
-    Arbiter::handle().spawn(
-        Timeout::new(Duration::new(0, 100), Arbiter::handle()).unwrap()
-            .then(|_| {
-                Arbiter::system().send(SystemExit(0));
-                future::result(Ok(()))
-            })
-    );
-
-    sys.run();
     assert!(started.load(Ordering::Relaxed), "Not started");
     assert!(!stopping.load(Ordering::Relaxed), "Stopping");
     assert!(!stopped.load(Ordering::Relaxed), "Stopped");
@@ -104,37 +104,32 @@ fn test_active_sync_address() {
 
 #[test]
 fn test_stop_after_drop_address() {
-    let sys = System::new("test");
-
     let started = Arc::new(AtomicBool::new(false));
     let stopping = Arc::new(AtomicBool::new(false));
     let stopped = Arc::new(AtomicBool::new(false));
+    let started1 = Arc::clone(&started);
+    let stopping1 = Arc::clone(&stopping);
+    let stopped1 = Arc::clone(&stopped);
 
-    let addr: Address<_> = MyActor{
-        started: Arc::clone(&started),
-        stopping: Arc::clone(&stopping),
-        stopped: Arc::clone(&stopped),
-        temp: None, restore_after_stop: false,
-    }.start();
+    System::run(move || {
+        let addr = MyActor {
+            started: started1,
+            stopping: stopping1,
+            stopped: stopped1,
+            temp: None,
+            restore_after_stop: false,
+        }
+        .start();
 
-    let started2 = Arc::clone(&started);
-    let stopping2 = Arc::clone(&stopping);
-    let stopped2 = Arc::clone(&stopped);
+        actix_rt::spawn(async move {
+            delay_for(Duration::new(0, 100)).await;
+            drop(addr);
+            delay_for(Duration::new(0, 10_000)).await;
+            System::current().stop();
+        });
+    })
+    .unwrap();
 
-    Arbiter::handle().spawn_fn(move || {
-        assert!(started2.load(Ordering::Relaxed), "Not started");
-        assert!(!stopping2.load(Ordering::Relaxed), "Stopping");
-        assert!(!stopped2.load(Ordering::Relaxed), "Stopped");
-
-        Timeout::new(Duration::new(0, 100), Arbiter::handle()).unwrap()
-            .then(move |_| {
-                drop(addr);
-                Arbiter::system().send(SystemExit(0));
-                future::result(Ok(()))
-            })
-    });
-
-    sys.run();
     assert!(started.load(Ordering::Relaxed), "Not started");
     assert!(stopping.load(Ordering::Relaxed), "Not stopping");
     assert!(stopped.load(Ordering::Relaxed), "Not stopped");
@@ -142,37 +137,71 @@ fn test_stop_after_drop_address() {
 
 #[test]
 fn test_stop_after_drop_sync_address() {
-    let sys = System::new("test");
+    let started = Arc::new(AtomicBool::new(false));
+    let stopping = Arc::new(AtomicBool::new(false));
+    let stopped = Arc::new(AtomicBool::new(false));
+    let started1 = Arc::clone(&started);
+    let stopping1 = Arc::clone(&stopping);
+    let stopped1 = Arc::clone(&stopped);
 
+    System::run(move || {
+        let addr = MyActor {
+            started: started1,
+            stopping: stopping1,
+            stopped: stopped1,
+            temp: None,
+            restore_after_stop: false,
+        }
+        .start();
+
+        actix_rt::spawn(async move {
+            delay_for(Duration::new(0, 100)).await;
+            drop(addr);
+            System::current().stop();
+        });
+    })
+    .unwrap();
+
+    assert!(started.load(Ordering::Relaxed), "Not started");
+    assert!(stopping.load(Ordering::Relaxed), "Not stopping");
+    assert!(stopped.load(Ordering::Relaxed), "Not stopped");
+}
+
+#[test]
+fn test_stop_after_drop_sync_actor() {
     let started = Arc::new(AtomicBool::new(false));
     let stopping = Arc::new(AtomicBool::new(false));
     let stopped = Arc::new(AtomicBool::new(false));
 
-    let addr: SyncAddress<_> = MyActor{
-        started: Arc::clone(&started),
-        stopping: Arc::clone(&stopping),
-        stopped: Arc::clone(&stopped),
-        temp: None, restore_after_stop: false,
-    }.start();
+    let started1 = Arc::clone(&started);
+    let stopping1 = Arc::clone(&stopping);
+    let stopped1 = Arc::clone(&stopped);
 
     let started2 = Arc::clone(&started);
     let stopping2 = Arc::clone(&stopping);
     let stopped2 = Arc::clone(&stopped);
 
-    Arbiter::handle().spawn_fn(move || {
-        assert!(started2.load(Ordering::Relaxed), "Not started");
-        assert!(!stopping2.load(Ordering::Relaxed), "Stopping");
-        assert!(!stopped2.load(Ordering::Relaxed), "Stopped");
+    System::run(move || {
+        let addr = SyncArbiter::start(1, move || MySyncActor {
+            started: Arc::clone(&started1),
+            stopping: Arc::clone(&stopping1),
+            stopped: Arc::clone(&stopped1),
+            restore_after_stop: false,
+        });
 
-        Timeout::new(Duration::new(0, 100), Arbiter::handle()).unwrap()
-            .then(move |_| {
-                drop(addr);
-                Arbiter::system().send(SystemExit(0));
-                future::result(Ok(()))
-            })
-    });
+        actix_rt::spawn(async move {
+            delay_for(Duration::from_secs(2)).await;
+            assert!(started2.load(Ordering::Relaxed), "Not started");
+            assert!(!stopping2.load(Ordering::Relaxed), "Stopping");
+            assert!(!stopped2.load(Ordering::Relaxed), "Stopped");
+            drop(addr);
 
-    sys.run();
+            delay_for(Duration::from_secs(2)).await;
+            System::current().stop();
+        });
+    })
+    .unwrap();
+
     assert!(started.load(Ordering::Relaxed), "Not started");
     assert!(stopping.load(Ordering::Relaxed), "Not stopping");
     assert!(stopped.load(Ordering::Relaxed), "Not stopped");
@@ -180,28 +209,30 @@ fn test_stop_after_drop_sync_address() {
 
 #[test]
 fn test_stop() {
-    let sys = System::new("test");
-
     let started = Arc::new(AtomicBool::new(false));
     let stopping = Arc::new(AtomicBool::new(false));
     let stopped = Arc::new(AtomicBool::new(false));
+    let started1 = Arc::clone(&started);
+    let stopping1 = Arc::clone(&stopping);
+    let stopped1 = Arc::clone(&stopped);
 
-    let _: () = MyActor{
-        started: Arc::clone(&started),
-        stopping: Arc::clone(&stopping),
-        stopped: Arc::clone(&stopped),
-        temp: None, restore_after_stop: false,
-    }.start();
+    System::run(move || {
+        MyActor {
+            started: started1,
+            stopping: stopping1,
+            stopped: stopped1,
+            temp: None,
+            restore_after_stop: false,
+        }
+        .start();
 
-    Arbiter::handle().spawn(
-        Timeout::new(Duration::new(0, 100), Arbiter::handle()).unwrap()
-            .then(|_| {
-                Arbiter::system().send(SystemExit(0));
-                future::result(Ok(()))
-            })
-    );
+        actix_rt::spawn(async move {
+            delay_for(Duration::new(0, 100)).await;
+            System::current().stop();
+        });
+    })
+    .unwrap();
 
-    sys.run();
     assert!(started.load(Ordering::Relaxed), "Not started");
     assert!(stopping.load(Ordering::Relaxed), "Not stopping");
     assert!(stopped.load(Ordering::Relaxed), "Not stopped");
@@ -209,28 +240,30 @@ fn test_stop() {
 
 #[test]
 fn test_stop_restore_after_stopping() {
-    let sys = System::new("test");
-
     let started = Arc::new(AtomicBool::new(false));
     let stopping = Arc::new(AtomicBool::new(false));
     let stopped = Arc::new(AtomicBool::new(false));
+    let started1 = Arc::clone(&started);
+    let stopping1 = Arc::clone(&stopping);
+    let stopped1 = Arc::clone(&stopped);
 
-    let _: () = MyActor{
-        started: Arc::clone(&started),
-        stopping: Arc::clone(&stopping),
-        stopped: Arc::clone(&stopped),
-        temp: None, restore_after_stop: true,
-    }.start();
+    System::run(move || {
+        MyActor {
+            started: started1,
+            stopping: stopping1,
+            stopped: stopped1,
+            temp: None,
+            restore_after_stop: true,
+        }
+        .start();
 
-    Arbiter::handle().spawn(
-        Timeout::new(Duration::new(0, 100), Arbiter::handle()).unwrap()
-            .then(|_| {
-                Arbiter::system().send(SystemExit(0));
-                future::result(Ok(()))
-            })
-    );
+        actix_rt::spawn(async move {
+            delay_for(Duration::new(0, 100)).await;
+            System::current().stop();
+        });
+    })
+    .unwrap();
 
-    sys.run();
     assert!(started.load(Ordering::Relaxed), "Not started");
     assert!(stopping.load(Ordering::Relaxed), "Not stopping");
     assert!(!stopped.load(Ordering::Relaxed), "Stopped");

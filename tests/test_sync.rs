@@ -1,18 +1,12 @@
-extern crate actix;
-extern crate futures;
-extern crate tokio_core;
-
-use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use futures::future;
-use actix::prelude::*;
+use std::sync::{Arc, Condvar, Mutex};
 
+use actix::prelude::*;
 
 struct Fibonacci(pub u32);
 
-impl ResponseType for Fibonacci {
-    type Item = u64;
-    type Error = ();
+impl Message for Fibonacci {
+    type Result = Result<u64, ()>;
 }
 
 struct SyncActor {
@@ -20,7 +14,6 @@ struct SyncActor {
     cond_l: Arc<Mutex<bool>>,
     counter: Arc<AtomicUsize>,
     messages: Arc<AtomicUsize>,
-    addr: SyncAddress<System>,
 }
 
 impl Actor for SyncActor {
@@ -36,16 +29,18 @@ impl Actor for SyncActor {
 }
 
 impl Handler<Fibonacci> for SyncActor {
-    fn handle(&mut self, msg: Fibonacci, _: &mut Self::Context) -> Response<Self, Fibonacci> {
+    type Result = Result<u64, ()>;
+
+    fn handle(&mut self, msg: Fibonacci, _: &mut Self::Context) -> Self::Result {
         let old = self.messages.fetch_add(1, Ordering::Relaxed);
         if old == 4 {
-            self.addr.send(msgs::SystemExit(0));
+            System::current().stop();
         }
 
         if msg.0 == 0 {
-            Self::reply_error(())
+            Err(())
         } else if msg.0 == 1 {
-            Self::reply(1)
+            Ok(1)
         } else {
             let mut i = 0;
             let mut sum = 0;
@@ -56,16 +51,15 @@ impl Handler<Fibonacci> for SyncActor {
                 last = curr;
                 curr = sum;
                 i += 1;
-	        }
-	        Self::reply(sum)
+            }
+            Ok(sum)
         }
     }
 }
 
 #[test]
-#[cfg_attr(feature="cargo-clippy", allow(mutex_atomic))]
+#[cfg_attr(feature = "cargo-clippy", allow(mutex_atomic))]
 fn test_sync() {
-    let sys = System::new("test");
     let l = Arc::new(Mutex::new(false));
     let cond = Arc::new(Condvar::new());
     let counter = Arc::new(AtomicUsize::new(0));
@@ -75,28 +69,30 @@ fn test_sync() {
     let cond_l_c = Arc::clone(&l);
     let counter_c = Arc::clone(&counter);
     let messages_c = Arc::clone(&messages);
-    let s_addr = Arbiter::system();
-    let addr = SyncArbiter::start(
-        2, move|| SyncActor{cond: Arc::clone(&cond_c),
-                            cond_l: Arc::clone(&cond_l_c),
-                            counter: Arc::clone(&counter_c),
-                            messages: Arc::clone(&messages_c),
-                            addr: s_addr.clone()}
-    );
 
-    let mut started = l.lock().unwrap();
-    while !*started {
-        started = cond.wait(started).unwrap();
-    }
+    System::run(move || {
+        let addr = SyncArbiter::start(2, move || SyncActor {
+            cond: Arc::clone(&cond_c),
+            cond_l: Arc::clone(&cond_l_c),
+            counter: Arc::clone(&counter_c),
+            messages: Arc::clone(&messages_c),
+        });
 
-    Arbiter::handle().spawn_fn(move || {
-        for n in 5..10 {
-            addr.send(Fibonacci(n));
+        let mut started = l.lock().unwrap();
+        while !*started {
+            started = cond.wait(started).unwrap();
         }
-        future::result(Ok(()))
-    });
 
-    sys.run();
+        for n in 5..10 {
+            addr.do_send(Fibonacci(n));
+        }
+    })
+    .unwrap();
+
     assert_eq!(counter.load(Ordering::Relaxed), 2, "Not started");
-    assert_eq!(messages.load(Ordering::Relaxed), 5, "Wrong number of messages");
+    assert_eq!(
+        messages.load(Ordering::Relaxed),
+        5,
+        "Wrong number of messages"
+    );
 }

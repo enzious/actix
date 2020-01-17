@@ -1,19 +1,15 @@
-//! Example of sync actor. It can be used for cpu bound tasks. Only one sync actor
-//! runs within arbiter's thread. Sync actor process one message at a time.
-//! Sync arbiter can start mutiple threads with separate instance of actor in each.
-
-extern crate actix;
-extern crate futures;
+//! Example of sync actor. It can be used for cpu bound tasks. Only one sync
+//! actor runs within arbiter's thread. Sync actor processes one message at a
+//! time. Sync arbiter can start multiple threads with separate instance of
+//! actor in each.
 
 use actix::prelude::*;
 
 struct Fibonacci(pub u32);
 
-impl ResponseType for Fibonacci {
-    type Item = u64;
-    type Error = ();
+impl Message for Fibonacci {
+    type Result = Result<u64, ()>;
 }
-
 
 struct SyncActor;
 
@@ -22,11 +18,13 @@ impl Actor for SyncActor {
 }
 
 impl Handler<Fibonacci> for SyncActor {
-    fn handle(&mut self, msg: Fibonacci, _: &mut Self::Context) -> Response<Self, Fibonacci> {
+    type Result = Result<u64, ()>;
+
+    fn handle(&mut self, msg: Fibonacci, _: &mut Self::Context) -> Self::Result {
         if msg.0 == 0 {
-            Self::reply_error(())
+            Err(())
         } else if msg.0 == 1 {
-            Self::reply(1)
+            Ok(1)
         } else {
             let mut i = 0;
             let mut sum = 0;
@@ -38,26 +36,20 @@ impl Handler<Fibonacci> for SyncActor {
                 curr = sum;
                 i += 1;
             }
-            Self::reply(sum)
+            Ok(sum)
         }
-   }
+    }
 }
 
-fn main() {
-    let sys = System::new("test");
-
+#[actix_rt::main]
+async fn main() {
     // start sync arbiter with 3 threads
     let addr = SyncArbiter::start(3, || SyncActor);
 
     // send 5 messages
     for n in 5..10 {
-        addr.send(Fibonacci(n));
+        println!("{:?}", addr.send(Fibonacci(n)).await.unwrap());
     }
 
-    Arbiter::handle().spawn_fn(|| {
-        Arbiter::system().send(msgs::SystemExit(0));
-        futures::future::result(Ok(()))
-    });
-
-    sys.run();
+    System::current().stop();
 }
